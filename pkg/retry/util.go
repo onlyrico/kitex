@@ -24,6 +24,7 @@ import (
 	"strconv"
 
 	"github.com/bytedance/gopkg/cloud/metainfo"
+
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
@@ -54,6 +55,8 @@ const (
 	OpDone
 )
 
+var tagValueFirstTry = "0"
+
 // DDLStopFunc is the definition of ddlStop func
 type DDLStopFunc func(ctx context.Context, policy StopPolicy) (bool, string)
 
@@ -67,12 +70,12 @@ func RegisterDDLStop(f DDLStopFunc) {
 // If Ingress is turned on in the current node, check whether RPC_PERSIST_DDL_REMAIN_TIME exists,
 // if it exists calculate handler time consumed by RPC_PERSIST_INGRESS_START_TIME and current time,
 // if handler cost > ddl remain time, then do not execute retry.
-func ddlStop(ctx context.Context, policy StopPolicy, logger klog.FormatLogger) (bool, string) {
+func ddlStop(ctx context.Context, policy StopPolicy) (bool, string) {
 	if !policy.DDLStop {
 		return false, ""
 	}
 	if ddlStopFunc == nil {
-		logger.Warnf("enable ddl stop for retry, but no ddlStopFunc is registered")
+		klog.Warnf("enable ddl stop for retry, but no ddlStopFunc is registered")
 		return false, ""
 	}
 	return ddlStopFunc(ctx, policy)
@@ -82,7 +85,7 @@ func chainStop(ctx context.Context, policy StopPolicy) (bool, string) {
 	if policy.DisableChainStop {
 		return false, ""
 	}
-	if _, exist := metainfo.GetPersistentValue(ctx, TransitKey); !exist {
+	if !IsRemoteRetryRequest(ctx) {
 		return false, ""
 	}
 	return true, "chain stop retry"
@@ -95,10 +98,10 @@ func circuitBreakerStop(ctx context.Context, policy StopPolicy, cbC *cbContainer
 	metricer := cbC.cbPanel.GetMetricer(cbKey)
 	errRate := metricer.ErrorRate()
 	sample := metricer.Samples()
-	if errRate < policy.CBPolicy.ErrorRate {
+	if sample < cbMinSample || errRate < policy.CBPolicy.ErrorRate {
 		return false, ""
 	}
-	return true, fmt.Sprintf("retry circuit break, errRate=%0.2f, sample=%d", errRate, sample)
+	return true, fmt.Sprintf("retry circuit break, errRate=%0.3f, sample=%d", errRate, sample)
 }
 
 func handleRetryInstance(retrySameNode bool, prevRI, retryRI rpcinfo.RPCInfo) {
@@ -124,7 +127,7 @@ func makeRetryErr(ctx context.Context, msg string, callTimes int32) error {
 	ri := rpcinfo.GetRPCInfo(ctx)
 	to := ri.To()
 
-	errMsg := fmt.Sprintf("retry[%d] failed, %s, to=%s, method=%s", callTimes-1, msg, to.ServiceName(), to.Method())
+	errMsg := fmt.Sprintf("retry[%d] failed, %s, toService=%s, method=%s", callTimes-1, msg, to.ServiceName(), to.Method())
 	target := to.Address()
 	if target != nil {
 		errMsg = fmt.Sprintf("%s, remote=%s", errMsg, target.String())
@@ -135,18 +138,14 @@ func makeRetryErr(ctx context.Context, msg string, callTimes int32) error {
 	return kerrors.ErrRetry.WithCause(errors.New(errMsg))
 }
 
-func panicToErr(ctx context.Context, panicInfo interface{}, ri rpcinfo.RPCInfo, logger klog.FormatLogger) error {
-	remoteInfo := ""
+func panicToErr(ctx context.Context, panicInfo interface{}, ri rpcinfo.RPCInfo) error {
+	toService, toMethod := "unknown", "unknown"
 	if ri != nil {
-		remoteInfo = fmt.Sprintf(", remote[to_psm=%s|method=%s]", ri.To().ServiceName(), ri.To().Method())
+		toService, toMethod = ri.To().ServiceName(), ri.To().Method()
 	}
-	err := fmt.Errorf("KITEX: panic in retry%s, err=%v\n%s",
-		remoteInfo, panicInfo, debug.Stack())
-	if l, ok := logger.(klog.CtxLogger); ok {
-		l.CtxErrorf(ctx, "%s", err.Error())
-	} else {
-		logger.Errorf("%s", err.Error())
-	}
+	err := fmt.Errorf("KITEX: panic in retry, to_service=%s to_method=%s error=%v\nstack=%s",
+		toService, toMethod, panicInfo, debug.Stack())
+	klog.CtxErrorf(ctx, "%s", err.Error())
 	return err
 }
 
@@ -159,10 +158,25 @@ func appendErrMsg(err error, msg string) {
 
 func recordRetryInfo(ri rpcinfo.RPCInfo, callTimes int32, lastCosts string) {
 	if callTimes > 1 {
-		if me := remoteinfo.AsRemoteInfo(ri.To()); me != nil {
-			me.SetTag(rpcinfo.RetryTag, strconv.Itoa(int(callTimes)-1))
+		if re := remoteinfo.AsRemoteInfo(ri.To()); re != nil {
+			re.SetTag(rpcinfo.RetryTag, strconv.Itoa(int(callTimes)-1))
 			// record last cost
-			me.SetTag(rpcinfo.RetryLastCostTag, lastCosts)
+			re.SetTag(rpcinfo.RetryLastCostTag, lastCosts)
 		}
 	}
+}
+
+// IsLocalRetryRequest checks whether it's a retry request by checking the RetryTag set in rpcinfo
+// It's supposed to be used in client middlewares
+func IsLocalRetryRequest(ctx context.Context) bool {
+	ri := rpcinfo.GetRPCInfo(ctx)
+	retryCountStr := ri.To().DefaultTag(rpcinfo.RetryTag, tagValueFirstTry)
+	return retryCountStr != tagValueFirstTry
+}
+
+// IsRemoteRetryRequest checks whether it's a retry request by checking the TransitKey in metainfo
+// It's supposed to be used in server side (handler/middleware)
+func IsRemoteRetryRequest(ctx context.Context) bool {
+	_, isRetry := metainfo.GetPersistentValue(ctx, TransitKey)
+	return isRetry
 }
